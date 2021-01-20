@@ -1,0 +1,325 @@
+#!bash
+# In Termux, the bash shell is not /usr/bin/bash or /bin/bash, but $PREFIX/bin/bash.
+# So if bash is in PATH, the shebang above always points to the right shell.
+
+# constant vars
+DEPENDENCIES=(screen)
+NULL=$PREFIX/tmp/null
+CACHE_DIR=$HOME/.cache/fdctl
+CURRNET_USER=$(whoami)
+SOCKET_DIR=$([[ $CURRNET_USER = "root" ]] && echo "/tmp/screens/S-root" || echo "/tmp/uscreens/S-$CURRNET_USER")
+
+# default vars
+QUIET=0
+
+# colors
+NC='\033[0m'
+RED='\033[0;31m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+BRED='\033[1;31m'
+BGREEN='\033[1;32m'
+BWHITE='\033[1;37m'
+
+# lib
+function msg() {
+	local msg_type=$1
+	local msg_content=$2
+
+	case $msg_type in
+		"I") # info
+			local INFO=1
+			local COLOR=$BLUE
+			local type="Info: "
+			;;
+		"W") # warning
+			local WARNING=1
+			local COLOR=$YELLOW
+			local type="Warning: "
+			;;
+		"D") # debug
+			local DEBUG=1
+			local type="Debug: "
+			;;
+		"E") # error
+			local ERROR=1
+			local COLOR=$RED
+			local type="Error: "
+			;;
+		*)   # others
+			;;
+	esac
+
+	[[ $QUIET -ne 1 ]] && echo -e ${COLOR}${type}${NC}${msg_content} || return 0
+}
+
+function checkHealth() {
+	local error_count=0
+
+	for dep in ${DEPENDENCIES[@]}; do
+		command -v $dep > $NULL
+		if [[ $? -ne 0 ]]; then
+			let error_count=error_count+1
+			msg E "Command not found: $dep"
+		fi
+	done
+
+	return $error_count
+}
+
+function cleanUp() {
+	screen -wipe > $NULL 2>&1
+
+	for session_name in $(ls $CACHE_DIR/daemons); do
+		root_dir=$CACHE_DIR/daemons/$session_name
+		if [[ $(cat $root_dir/status 2> $NULL) -ne 1 && $session_name =~ DIFF\-* ]]; then 
+			[[ -d $root_dir ]] && rm -r $root_dir && msg I "Removed useless daemon ${BWHITE}${session_name}${NC}'s dir.'"
+		fi
+	done
+}
+
+function w2file() {
+	mkdir -p $(dirname $1)
+	echo -e $2 > $1
+}
+
+function a2file() {
+	[[ -f $1 ]] && echo -e $2 >> $1
+}
+
+function parseSocket() {
+	local foo=$1
+
+	local socket_name=$(basename $(find $SOCKET_DIR -name "*.${foo}" 2> $NULL) 2> $NULL)
+	if [[ -z $socket_name ]]; then
+		msg E "${BWHITE}$1${NC} does not exist." && exit 1
+	fi
+	local session_name=${socket_name##*.}
+	local ppid=${socket_name%%.*}
+	local pid=$(ps -ef | grep "[0-9] $(which bash) $CACHE_DIR/daemons/$session_name/start" | awk '{print $2}')
+
+	echo "$pid $session_name"
+}
+
+function statusSync() {
+	for session_name in $(ls $CACHE_DIR/daemons); do
+		root_dir=$CACHE_DIR/daemons/$session_name
+		if [[ $(cat $root_dir/status) -eq 1 && -z $(ls $SOCKET_DIR | grep $session_name 2> $NULL) ]]; then
+			w2file $root_dir/status 0
+		fi
+	done
+}
+
+# subcmds
+function _autostart() {
+	local session_name
+	for session_name in $(ls $CACHE_DIR/daemons); do
+		if [[ $(cat $CACHE_DIR/daemons/$session_name/autostart 2> $NULL) -eq 1 ]]; then
+			_start $session_name
+		fi
+	done
+}
+
+function _cleanall() {
+	screen -wipe > $NULL 2>&1
+
+	for session_name in $(ls $CACHE_DIR/daemons); do
+		root_dir=$CACHE_DIR/daemons/$session_name
+		if [[ $(cat $root_dir/autostart 2> $NULL) -ne 1 \
+			&& $(cat $root_dir/status 2> $NULL) -ne 1 \
+			&& $(cat $root_dir/keep 2> $NULL) -ne 1 ]]; then
+				[[ -d $root_dir ]] && rm -r $root_dir && msg I "Removed useless daemon ${BWHITE}${session_name}${NC}'s dir.'"
+		fi
+	done
+	
+	msg - "Done."
+}
+
+function _enable() {
+	foo=$1
+	root_dir=$CACHE_DIR/daemons/$1
+	start_script=$root_dir/start
+
+	if [[ -f $start_script ]]; then
+		w2file $root_dir/autostart 1
+	else
+		msg E "Unknown daemon: ${BWHITE}${foo}${NC}." && exit 1
+	fi
+}
+
+function _disable() {
+	foo=$1
+	root_dir=$CACHE_DIR/daemons/$1
+	start_script=$root_dir/start
+
+	if [[ -f $start_script ]]; then
+		w2file $root_dir/autostart 0
+	else
+		msg E "Unknown daemon: ${BWHITE}${foo}${NC}." && exit 1
+	fi
+}
+
+function _keep() {
+	foo=$1
+	root_dir=$CACHE_DIR/daemons/$foo
+	start_script=$root_dir/start
+
+	if [[ -f $start_script ]]; then
+		w2file $root_dir/keep 1
+	else
+		msg E "Unknown daemon: ${BWHITE}${foo}${NC}." && exit 1
+	fi
+}
+
+function _restart() {
+	local foo=$1
+
+	if [[ -f $CACHE_DIR/daemons/$foo/start ]]; then
+		local session_name=$foo
+		_stop $session_name && _start $session_name
+	else
+		msg E "Unknown daemon: ${BWHITE}${foo}${NC}." && exit 1
+	fi
+}
+
+function _start() {
+	local foo=$1
+	local bar=$2
+
+	local root_dir=$CACHE_DIR/daemons/$foo
+	local start_script=$root_dir/start
+	local session_name
+
+	[[ -z $foo ]] && msg E "Missing arguments." && exit 1
+
+	if [[ -z $bar ]]; then # maybe this daemon is started up before
+		if [[ -f $start_script ]]; then
+			if [[ $(cat $root_dir/status 2> $NULL) -eq 1 ]]; then
+				msg I "Daemon ${BWHITE}${foo}${NC} already started." && exit 1
+			else
+				session_name=$foo
+			fi
+		else
+			msg E "Missing startup command." && exit 1
+		fi
+
+	else # going to create or overwrite start_script
+		if [[ $(cat $root_dir/status 2> $NULL) -eq 1 ]]; then
+			session_name="DIFF"-${RANDOM}-$foo
+		else
+			session_name=$foo
+		fi
+
+		root_dir=$CACHE_DIR/daemons/$session_name
+		start_script=$root_dir/start
+
+		w2file $start_script "#!$(which bash)"
+		a2file $start_script $bar
+	fi
+
+	screen -dmS $session_name $(which bash) $start_script
+	
+	local baz=$(parseSocket $session_name)
+	local pid=${baz%% *}
+	kill -0 $pid > $NULL 2>&1
+	if [[ $? -eq 0 ]]; then
+		w2file $root_dir/status 1 && msg - "Daemon ${BWHITE}${session_name}${NC} successfully started."
+	else
+		msg E "Daemon ${BWHITE}${session_name}${NC} failed to start." && exit 1
+	fi
+}
+
+function _status() {
+	local foo=$1
+
+	local RUNNING=✔
+	local status
+	local print_format_template="%-20s %-s\n"
+	local print_format="${BWHITE}%-20s${NC} ${BGREEN}%-s${NC}\n"
+
+
+	if [[ -z $foo ]]; then
+		printf "$print_format_template" "Daemon" "Running"
+		for session_name in $(ls $CACHE_DIR/daemons); do
+			root_dir=$CACHE_DIR/daemons/$session_name
+			if [[ $(cat $root_dir/status 2> $NULL) -eq 1 ]]; then
+				status=$RUNNING
+			else
+				status=""
+			fi
+			printf "$print_format" $session_name $status
+		done
+	else
+		if [[ -f $CACHE_DIR/daemons/$foo/start ]]; then
+			root_dir=$CACHE_DIR/daemons/$foo
+			if [[ $(cat $root_dir/status 2> $NULL) -eq 1 ]]; then
+				status=$RUNNING
+			else
+				status=""
+			fi
+			printf "$print_format_template" "Daemon" "Running"
+			printf "$print_format" $session_name $status && exit 0
+		else
+			msg E "Unknown daemon: ${BWHITE}${foo}${NC}." && exit 1
+		fi
+	fi
+}
+
+function _stop() {
+	local tmp=$(QUIET=1 parseSocket $1)
+	local pid=${tmp%% *}
+	local session_name=${tmp##* }
+
+	screen -r $session_name -X quit > $NULL 2>&1 && w2file $CACHE_DIR/daemons/$session_name/status 0 && msg - "Daemon ${BWHITE}${session_name}${NC} successfully stopped."
+	kill $pid > $NULL 2>&1 || return 0 # ensure that process is really stopped
+}
+
+# entrance
+function main() {
+	local subcmd=$1
+
+	checkHealth
+	statusSync
+	cleanUp
+
+	case $subcmd in
+		"autostart")
+			shift
+			_autostart $@
+			;;
+		"cleanall")
+			shift
+			_cleanall $@
+			;;
+		"enable")
+			shift
+			_enable $@
+			;;
+		"disable")
+			shift
+			_disable $@
+			;;
+		"keep")
+			shift
+			_shift $@
+			;;
+		"restart")
+			shift
+			_restart $@
+			;;
+		"start")
+			shift
+			_start $@
+			;;
+		"status")
+			shift
+			_status $@
+			;;
+		"stop")
+			shift
+			_stop $@
+			;;
+	esac
+}
+
+main $@
